@@ -61,6 +61,27 @@ $env:SUPADATA_API_KEY = "YOUR_OWN_API_KEY"
 
 Do not paste a real API key into a public GitHub repository, example command, screenshot, or issue. The script reads it from your environment and sends it only in the API's `x-api-key` request header. The `.gitignore` also excludes local `.env` files, although this tutorial does not require one.
 
+## Repository contents — every linked file is committed
+
+This is not a README-only demo. You can inspect and execute all the referenced files in this public repository:
+
+~~~text
+supadata-video-notes/
+├── README.md
+├── video_to_notes.py
+├── tests/
+│   ├── test_video_to_notes.py
+│   └── test_repo_docs.py
+├── examples/
+│   ├── quickstart_async.py
+│   └── EXAMPLE.md
+├── .github/workflows/tests.yml
+├── .gitignore
+└── LICENSE
+~~~
+
+The **batch CLI** is [video_to_notes.py](video_to_notes.py). The [async quickstart](examples/quickstart_async.py) is a smaller script that you can read in one sitting. [Offline tests](tests/test_video_to_notes.py) verify the request encoding, immediate results, queued jobs, failed jobs, filenames, and actual local file creation, without an API key or credit consumption.
+
 ## 3. Make your first transcript note
 
 Run the following example from the repository directory:
@@ -104,45 +125,148 @@ These two addresses point to the same example video, but they demonstrate that e
 
 To export plain text instead of Markdown, replace `--format json` with `--format txt`. To request a preferred transcript language, pass `--lang en` or another supported language code. Treat `--lang` as a **preference**, not a guarantee of translation: Supadata can return another available transcript language. In generated mode, the API documentation says the transcription language follows the video and the requested language is ignored.
 
-## 5. Understand the working Python code
+## 5. Working code: synchronous results, 202 jobs, polling, and exporting
 
-The complete implementation is in [`video_to_notes.py`](video_to_notes.py). The key API call is equivalent to:
+A useful technical subtlety is that the same Supadata endpoint can return two different outcomes. An HTTP 200 response with `text=true` contains a string `content` and `lang`. An HTTP 202 response instead supplies a `jobId`. Calling the transcript endpoint only once and assuming that the reply always has a `content` field will break when processing long videos.
 
-```python
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
+For the asynchronous branch, make authenticated calls to **GET /v1/transcript/{jobId}** every second. Keep polling while `status` is `queued` or `active`; extract the content after `completed`; surface the error after `failed`. Always bound your waiting time. The official [transcript specification](https://docs.supadata.ai/get-transcript) documents these statuses, the REST response shape and the job expiration window.
+
+The complete standalone program below is exactly the source of [examples/quickstart_async.py](examples/quickstart_async.py). It makes the initial request, polls when necessary, and writes a local Markdown file. It uses only the Python standard library:
+
+~~~python
+#!/usr/bin/env python3
+"""Complete standalone Supadata REST transcript -> Markdown demonstration.
+
+Requires a real SUPADATA_API_KEY; may use Supadata credits. Python 3.10+.
+"""
 import json
 import os
+import time
+from pathlib import Path
+from urllib.parse import quote, urlencode
+from urllib.request import Request, urlopen
 
-params = urlencode({
-    "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
-    "text": "true",
-    "mode": "native",
+API = "https://api.supadata.ai/v1"
+VIDEO_URL = "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+KEY = os.environ["SUPADATA_API_KEY"]
+
+
+def get_json(path, params=None):
+    url = API + path
+    if params:
+        url += "?" + urlencode(params)
+    request = Request(url, headers={"x-api-key": KEY})
+    with urlopen(request, timeout=120) as response:
+        return json.load(response)
+
+
+result = get_json("/transcript", {
+    "url": VIDEO_URL,
+    "text": "true",  # Plain text rather than timestamped chunks
+    "mode": "native",  # Avoid accidental AI-generation charges
 })
-request = Request(
-    f"https://api.supadata.ai/v1/transcript?{params}",
-    headers={"x-api-key": os.environ["SUPADATA_API_KEY"]},
+
+if "jobId" in result:
+    job_id = result["jobId"]
+    deadline = time.monotonic() + 300
+    while time.monotonic() < deadline:
+        time.sleep(1)
+        job = get_json("/transcript/" + quote(job_id, safe=""))
+        if job["status"] == "completed":
+            result = job.get("result", job)  # REST: top-level; SDK: result object
+            break
+        if job["status"] == "failed":
+            raise RuntimeError(f"Transcription failed: {job.get('error')}")
+        if job["status"] not in ("queued", "active"):
+            raise RuntimeError(f"Unexpected status: {job['status']}")
+    else:
+        raise TimeoutError("Transcript job did not finish in 5 minutes")
+
+transcript = result["content"]
+assert isinstance(transcript, str), "Expected text=true string content"
+quoted_text = "\n".join("> " + line for line in transcript.splitlines())
+note = ("# Video transcript note\n\n"
+        + f"- **Source:** {VIDEO_URL}\n"
+        + f"- **Language:** {result.get('lang', 'unknown')}\n\n"
+        + "## Transcript\n\n" + quoted_text + "\n")
+Path("quickstart-note.md").write_text(note, encoding="utf-8")
+print("Saved: quickstart-note.md")
+~~~
+
+Run it from the repository root after setting your API key:
+
+~~~bash
+python3 examples/quickstart_async.py
+~~~
+
+It writes `quickstart-note.md`. This small script intentionally keeps error handling brief, so the control flow is obvious. For practical usage, [video_to_notes.py](video_to_notes.py) additionally supports **multiple URLs**, safe URL-derived filenames, JSON/TXT/Markdown formats, request retries for 429/selected 5xx responses, a timeout, and per-URL failure reporting. It is not merely pseudocode: you can execute the batch commands above against publicly accessible videos with your own API key.
+
+### Example Markdown output (illustrative fixture)
+
+To show what a generated note looks like *before* spending credits, here is a short example from the expected formatter. **The transcript sentences are synthetic demonstration text, not a claimed live Supadata response**, and the example does not redistribute a third-party video's spoken content. The [example file](examples/EXAMPLE.md) explains the same distinction.
+
+~~~markdown
+# Video transcript note
+
+- **Source:** https://example.com/public-video
+- **Transcript language:** en
+- **Retrieved:** 2026-11-20 08:00 UTC
+
+## Transcript
+
+> Welcome to our public demo.
+> Today we will explain how transcripts become searchable notes.
+~~~
+
+In a live run the source, retrieved time and language are set by the exporter, and the quoted body is the returned API text. The tool does not invent a title, summary, speaker identity or timestamps.
+
+### Official Python SDK: a shorter alternative
+
+If you prefer the [Supadata Python SDK](https://github.com/supadata-ai/py), install a release that supports `transcript.get_job_status` (the [official docs](https://docs.supadata.ai/get-transcript) specify version 1.7.0 or newer):
+
+~~~bash
+python3 -m pip install "supadata>=1.7.0"
+~~~
+
+Here is a comparable one-video flow with an explicit polling loop:
+
+~~~python
+import os
+import time
+from supadata import Supadata
+
+client = Supadata(api_key=os.environ["SUPADATA_API_KEY"])
+transcript = client.transcript(
+    url="https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+    text=True,
+    mode="native",
 )
-with urlopen(request, timeout=120) as response:
-    result = json.load(response)
-print(result)
-```
+if hasattr(transcript, "content"):
+    print(transcript.content)
+else:
+    for attempt in range(300):
+        job = client.transcript.get_job_status(transcript.job_id)
+        if job.status == "completed":
+            print(job.result.content)
+            break
+        if job.status == "failed":
+            raise RuntimeError(str(job.error))
+        time.sleep(1)
+    else:
+        raise TimeoutError("The job exceeded the polling window")
+~~~
 
-This small snippet is sufficient to demonstrate authentication and URL encoding, but production-oriented examples need more care. Our complete tool adds bounded retries for rate limits and common transient server errors. It validates the returned JSON, reports readable errors, and saves files with UTF-8 encoding, which matters when transcripts contain Chinese, Japanese, or other non-ASCII text.
+The SDK can make integration into an existing Python project more ergonomic. The standard-library CLI in this repository avoids installing dependencies, and already includes batching, retries, export choices, and tests. Both methods call Supadata's service and can consume credits.
 
-The other important detail is **asynchronous processing**. An existing short transcript may arrive immediately with HTTP 200 and a string `content` field. Longer processing can instead return HTTP 202 and a `jobId`. In that case, the script polls `GET /v1/transcript/{jobId}` until it sees `completed` or `failed`. It also accepts a timeout so a stuck job cannot loop forever. The polling interval and total wait can be adjusted with `--poll-interval` and `--max-wait`.
+### Cost, language and provenance are engineering concerns
 
-For example, to allow more time for a long video:
+As documented in Supadata's [pricing section](https://docs.supadata.ai/get-transcript#pricing) at the time of writing, **one native transcript costs 1 credit**, while **generated transcription costs 2 credits per minute**. A 206 "Transcript Unavailable" response may cost a credit as well. **Polling the asynchronous job-status endpoint does not incur additional credits.** For async generation, a charge estimate may be returned initially and the final amount reconciled on completion. Check current pricing before bulk ingestion.
 
-```bash
-python3 video_to_notes.py \
-  "https://www.youtube.com/watch?v=dQw4w9WgXcQ" \
-  --mode auto \
-  --max-wait 600 \
-  --poll-interval 2
-```
+Choose `mode=native` to request only existing captions and avoid accidentally switching to generation. Choose `mode=auto` to try native captions first and generate if missing. `mode=generate` always uses AI for transcription. For example, 20 successful native transcript requests would nominally consume 20 credits, but 10 generated videos lasting 15 minutes each would consume 300 credits at the documented generation rate.
 
-The script asks for `text=true` because this tutorial is about searchable notes. If you want subtitles with timestamps, change the request to `text=false` and use the segment objects returned by the API. Those objects contain text and timing information, which can be converted to formats such as SRT. Do not treat the plain-text result as timestamped output.
+The `lang` argument is a **language preference, not translation**. An available different-language track may be returned, so retain `lang` from the response; when generating, the API docs say the input `lang` preference is ignored and speech is transcribed in the video's language.
+
+This tutorial requests `text=true`, which is plain text **without timestamps**. To retain timings, use `text=false` and process segment `offset` and `duration` values in milliseconds. Avoid implying temporal precision the response does not provide. If no speech is detected, a successful empty result can still be billable.
 
 ## 6. Test without consuming credits
 
